@@ -1,0 +1,689 @@
+const groomScript = `
+(() => {
+  if (!window.groom) window.groom = {};
+  window.groom.detectedFields = [];
+  window.groom.filledFields = new WeakSet();
+
+  window.groom.enabled = true;
+  window.groom._intervalId = null;
+
+  function addTabListeners() {
+    document.body.addEventListener('shown.bs.tab', restartGroom, true);
+    document.body.addEventListener('show.bs.tab', restartGroom, true);
+    document.body.addEventListener('click', function(e) {
+      if (
+        e.target.matches('[role="tab"], .nav-link, .tab-link, .tab-btn, .tab-header, .tabs li, .tab') ||
+        e.target.closest('[role="tab"], .nav-link, .tab-link, .tab-btn, .tab-header, .tabs li, .tab')
+      ) {
+        setTimeout(restartGroom, 300);
+      }
+    }, true);
+    document.body.addEventListener('focusin', function(e) {
+      if (
+        e.target.matches('[role="tab"], .nav-link, .tab-link, .tab-btn, .tab-header, .tabs li, .tab') ||
+        e.target.closest('[role="tab"], .nav-link, .tab-link, .tab-btn, .tab-header, .tabs li, .tab')
+      ) {
+        setTimeout(restartGroom, 300);
+      }
+    }, true);
+  }
+
+  // ==== مراقبة التغيرات في الصفحة ====
+  let groomMutationObserver = null;
+  function observeDomChanges() {
+    // أوقف أي متابع سابق
+    if (groomMutationObserver) groomMutationObserver.disconnect();
+    groomMutationObserver = new MutationObserver((mutationsList) => {
+      let fieldOrButtonAdded = false;
+      for (const mutation of mutationsList) {
+        for (const node of mutation.addedNodes) {
+          if (
+            (node.nodeType === 1 && (
+              node.matches?.('input, textarea, select, button, [role="button"], .modal, [role="dialog"], .tab-pane, [role="tabpanel"]') ||
+              node.querySelector?.('input, textarea, select, button, [role="button"], .modal, [role="dialog"], .tab-pane, [role="tabpanel"]')
+            ))
+          ) {
+            fieldOrButtonAdded = true;
+            break;
+          }
+        }
+        if (fieldOrButtonAdded) break;
+      }
+      if (fieldOrButtonAdded) {
+        // انتظر حتى يستقر الدوم قليلا
+        setTimeout(processFieldsEverywhere, 200);
+      }
+    });
+    groomMutationObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  // ==== مراقبة التغيرات في عنوان الصفحة (redirect) ====
+  let lastLocationHref = location.href;
+  function observeLocationChange() {
+    setInterval(() => {
+      if (location.href !== lastLocationHref) {
+        lastLocationHref = location.href;
+        // أعد تشغيل السكريبت بعد التوجيه
+        setTimeout(restartGroom, 400);
+      }
+    }, 500);
+    // أيضا استمع لحدث popstate (تغيير في history API)
+    window.addEventListener('popstate', () => {
+      setTimeout(restartGroom, 400);
+    });
+    // وبعض المواقع تستخدم pushState مباشرة بدون popstate
+    // يمكننا مراقبتها بإعادة تعريف pushState
+    if (!window._groomPushStateWrapped) {
+      const origPushState = history.pushState;
+      history.pushState = function(...args) {
+        origPushState.apply(this, args);
+        setTimeout(() => {
+          if (location.href !== lastLocationHref) {
+            lastLocationHref = location.href;
+            restartGroom();
+          }
+        }, 400);
+      };
+      window._groomPushStateWrapped = true;
+    }
+  }
+
+  function restartGroom() {
+    stopGroomInterval();
+    resetGroomState();
+    processFieldsEverywhere();
+    startGroomInterval();
+  }
+
+  function resetGroomState() {
+    window.groom.detectedFields = [];
+    window.groom.filledFields = new WeakSet();
+    window.groom._lastFilledElements = new Set();
+    lastOrder = "";
+  }
+
+  window.toggleGroom = function(state) {
+    if (typeof state === "boolean") window.groom.enabled = state;
+    else window.groom.enabled = !window.groom.enabled;
+    if (window.groom.enabled) {
+      startGroomInterval();
+      observeDomChanges();
+      console.log("🟢 Groom enabled");
+    } else {
+      stopGroomInterval();
+      if (groomMutationObserver) groomMutationObserver.disconnect();
+      console.log("🔴 Groom disabled");
+    }
+  };
+
+  window.groom.options = {
+    name: true,
+    birth: true,
+    phone: true,
+    email: true,
+    password: true,
+    geo: true,
+    surveyclickbottom: true,
+    surveyselectandcheckbox: true,
+    cardcredit: true
+  };
+
+  window.groom.manualOrderEnabled = false;
+  window.groom.manualOrder = [
+    "name", "birth", "email", "phone", "password", "geo", "cardcredit", "surveyselectandcheckbox", "surveyclickbottom"
+  ];
+
+  window.toggleManualOrder = function(state, orderArr) {
+    if(typeof state === "boolean") window.groom.manualOrderEnabled = state;
+    else window.groom.manualOrderEnabled = !window.groom.manualOrderEnabled;
+    if(Array.isArray(orderArr)) window.groom.manualOrder = orderArr;
+    console.log("Manual order is now", window.groom.manualOrderEnabled ? "ENABLED" : "DISABLED");
+    if(window.groom.enabled) processFieldsEverywhere();
+  };
+
+  function getAllModalsAndTabs() {
+    const selectors = [
+      'dialog[open]',
+      '[role="dialog"]:not([aria-hidden="true"])',
+      '[role="dialog"]:not([hidden])',
+      '.modal.show',
+      '.modal[aria-hidden="false"]'
+    ];
+    let modals = [];
+    selectors.forEach(sel => {
+      try {
+        modals = modals.concat([...document.querySelectorAll(sel)]);
+      } catch {}
+    });
+    const tabPanels = [...document.querySelectorAll('[role="tabpanel"], .tab-pane')];
+    return [...modals, ...tabPanels, document.body];
+  }
+
+  // === دوال الملء تقبل العنصر مباشرة (el) ===
+
+  window.fillGeo = (el) => {
+    if (!window.groom.options.geo || !el) return null;
+    if (!el.value && !window.groom.filledFields.has(el)) {
+      el.value = "Tunis";
+      window.groom.filledFields.add(el);
+      return el;
+    }
+    return null;
+  };
+
+  window.fillName = (el) => {
+    if (!window.groom.options.name || !el) return null;
+    if (!el.value && !window.groom.filledFields.has(el)) {
+      el.value = "John Doe";
+      window.groom.filledFields.add(el);
+      return el;
+    }
+    return null;
+  };
+
+  window.fillBirth = (el) => {
+    if (!window.groom.options.birth || !el) return null;
+    if (!el.value && !window.groom.filledFields.has(el)) {
+      el.value = "1990-01-01";
+      window.groom.filledFields.add(el);
+      return el;
+    }
+    return null;
+  };
+
+  window.fillPhone = (el) => {
+    if (!window.groom.options.phone || !el) return null;
+    if (!el.value && !window.groom.filledFields.has(el)) {
+      el.value = "912123456";
+      window.groom.filledFields.add(el);
+      return el;
+    }
+    return null;
+  };
+
+  window.fillEmail = async (el) => {
+    if (!window.groom.options.email || !el) return null;
+    try {
+      if (!window.informer) window.informer = {};
+      function randomDelay(min = 70, max = 150) {
+        return Math.floor(Math.random() * (max - min + 1)) + min;
+      }
+      function dispatchKeyEvents(element, char) {
+        const keyCode = char.toUpperCase().charCodeAt(0);
+        const keydownEvent = new KeyboardEvent('keydown', {
+          key: char,
+          code: 'Key' + char.toUpperCase(),
+          keyCode: keyCode,
+          which: keyCode,
+          bubbles: true,
+          cancelable: true
+        });
+        const keypressEvent = new KeyboardEvent('keypress', {
+          key: char,
+          code: 'Key' + char.toUpperCase(),
+          keyCode: keyCode,
+          which: keyCode,
+          bubbles: true,
+          cancelable: true
+        });
+        const inputEvent = new InputEvent('input', {
+          data: char,
+          bubbles: true,
+          cancelable: true
+        });
+        const keyupEvent = new KeyboardEvent('keyup', {
+          key: char,
+          code: 'Key' + char.toUpperCase(),
+          keyCode: keyCode,
+          which: keyCode,
+          bubbles: true,
+          cancelable: true
+        });
+        element.dispatchEvent(keydownEvent);
+        element.dispatchEvent(keypressEvent);
+        element.dispatchEvent(inputEvent);
+        element.dispatchEvent(keyupEvent);
+      }
+      async function humanType(element, text) {
+        element.focus();
+        element.value = '';
+        await new Promise(r => setTimeout(r, randomDelay(300, 600)));
+        for (let i = 0; i < text.length; i++) {
+          const char = text[i];
+          dispatchKeyEvents(element, char);
+          element.value += char;
+          element.dispatchEvent(new Event('input', { bubbles: true }));
+          await new Promise(r => setTimeout(r, randomDelay()));
+        }
+        await new Promise(r => setTimeout(r, randomDelay(300, 600)));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+        element.blur();
+      }
+      if (window.informer.email && typeof window.informer.email === 'string' && window.informer.email.trim() !== '') {
+        await humanType(el, window.informer.email.trim());
+        window.groom.filledFields.add(el);
+        return el;
+      }
+      const response = await fetch('https://raw.githubusercontent.com/Charfeddine0/names/main/emails.txt');
+      const text = await response.text();
+      const emails = text.split('\\n').map(e => e.trim()).filter(e => e.length > 0);
+      if (emails.length === 0) {
+        console.warn('لا يوجد ايميلات في الملف');
+        return null;
+      }
+      const randomEmail = emails[Math.floor(Math.random() * emails.length)];
+      window.informer.email = randomEmail;
+      await humanType(el, randomEmail);
+      window.groom.filledFields.add(el);
+      return el;
+    } catch (error) {
+      console.error('خطأ أثناء جلب أو ملء الإيميل:', error);
+      return null;
+    }
+  };
+
+  window.fillPassword = (el) => {
+    if (!window.groom.options.password || !el) return null;
+    if (!el.value && !window.groom.filledFields.has(el)) {
+      el.value = "P@ssw0rd123";
+      window.groom.filledFields.add(el);
+      return el;
+    }
+    return null;
+  };
+
+  window.fillCardcredit = (el) => {
+    if (!window.groom.options.cardcredit || !el) return null;
+    if (!el.value && !window.groom.filledFields.has(el)) {
+      el.value = "4111 1111 1111 1111";
+      window.groom.filledFields.add(el);
+      return el;
+    }
+    return null;
+  };
+
+  window.fillSurveyselectandcheckbox = (contextRoot=document.body) => {
+    if (!window.groom.options.surveyselectandcheckbox) return null;
+    const checkboxes = [...contextRoot.querySelectorAll('input[type="checkbox"]:not(:checked)')];
+    checkboxes.forEach(cb => { cb.checked = true; cb.dispatchEvent(new Event("change", {bubbles:true})); });
+    const radios = [...contextRoot.querySelectorAll('input[type="radio"]')];
+    const radioGroups = {};
+    radios.forEach(r => {
+      if (!r.checked) {
+        if (!radioGroups[r.name]) {
+          r.checked = true;
+          r.dispatchEvent(new Event("change", {bubbles:true}));
+          radioGroups[r.name] = true;
+        }
+      }
+    });
+    const selects = [...contextRoot.querySelectorAll('select')];
+    selects.forEach(sel => {
+      if (sel.selectedIndex <= 0 && sel.options.length > 1) {
+        sel.selectedIndex = 1;
+        sel.dispatchEvent(new Event("change", {bubbles:true}));
+      }
+    });
+    return {checkboxes, radios, selects};
+  };
+
+  window.fillSurveyclickbottom = (btnOrContext=document.body) => {
+    if (btnOrContext instanceof HTMLElement && (
+      btnOrContext.tagName === 'BUTTON' ||
+      btnOrContext.tagName === 'INPUT' ||
+      btnOrContext.tagName === 'A' ||
+      btnOrContext.tagName === 'DIV' ||
+      btnOrContext.tagName === 'SPAN'
+    )) {
+      // منع التكرار: لا تضغط الزر إذا كان بالفعل مضغوط سابقا
+      if (!window.groom._lastFilledElements) window.groom._lastFilledElements = new Set();
+      if (window.groom._lastFilledElements.has(btnOrContext)) {
+        return btnOrContext;
+      }
+      btnOrContext.click();
+      window.groom._lastFilledElements.add(btnOrContext);
+      return btnOrContext;
+    }
+    const buttonSelector = [
+      'button',
+      'input[type="submit"]',
+      'input[type="button"]',
+      'a[role="button"]',
+      'a[href="#"]',
+      'div[role="button"]',
+      'span[role="button"]',
+      'div[id*="btn" i], div[class*="btn" i], div[id*="button" i], div[class*="button" i], div[id*="sub" i], div[class*="sub" i], div[class*="continue" i], div[id*="continue" i], div[class*="next" i]',
+      'span[id*="btn" i], span[class*="btn" i], span[id*="button" i], span[class*="button" i], span[class*="continue" i], span[id*="continue" i], span[class*="next" i], span[class*="next" i]',
+      'a[id*="btn" i], a[class*="btn" i], a[class*="continue" i], a[id*="continue" i], a[class*="next" i], a[id*="next" i]'
+    ].join(',');
+    const btns = [
+      ...btnOrContext.querySelectorAll(buttonSelector)
+    ].filter(btn => {
+      if (btn.type && btn.type.toLowerCase() === "hidden") return false;
+      if (btn.offsetParent === null) return false;
+      if (btn.hasAttribute("hidden")) return false;
+      if (btn.getAttribute("aria-hidden") === "true") return false;
+      if (getComputedStyle(btn).display === "none") return false;
+      if (getComputedStyle(btn).visibility === "hidden") return false;
+      const txt = (btn.innerText || btn.value || '').toLowerCase();
+      const cls = (btn.className || '').toLowerCase();
+      const id = (btn.id || '').toLowerCase();
+      return /continue|next|submit|validate|confirm|send|done|save|التالي|متابعة|انهاء|أرسل/.test(txt + ' ' + cls + ' ' + id);
+    });
+    if (btns.length > 0) {
+      // منع التكرار: لا تضغط الزر إذا كان بالفعل مضغوط سابقا
+      if (!window.groom._lastFilledElements) window.groom._lastFilledElements = new Set();
+      const btn = btns[btns.length-1];
+      if (window.groom._lastFilledElements.has(btn)) {
+        return btn;
+      }
+      btn.click();
+      window.groom._lastFilledElements.add(btn);
+      return btn;
+    }
+    return null;
+  };
+
+  // === كشف الحقول ===
+
+  const keywordMap = {
+    name: [
+      "name", "full name", "first name", "last name", "surname", "given name", "your name", "user name", "username",
+      "fullname", "contact name", "account name"
+    ],
+    birth: [
+      "birth", "date of birth", "dob", "birthday", "birthdate", "date", "age", "year of birth", "born"
+    ],
+    phone: [
+      "phone", "mobile", "cell", "telephone", "tel", "gsm", "contact number", "mobile number", "phone number", "cellphone"
+    ],
+    email: [
+      "email", "email address", "e-mail", "mail", "your email", "contact email"
+    ],
+    password: [
+      "password", "pass", "pwd", "passwd", "mot de passe", "كلمة السر", "كلمة المرور"
+    ],
+    surveyclickbottom: [
+      "survey", "finish survey", "استكمال الاستبيان", "submit survey", "next", "continue", "التالي", "متابعة"
+    ],
+    surveyselectandcheckbox: [
+      "select", "checkbox", "اختيار", "مربع اختيار", "check", "radio", "مربع", "إجابة", "answer"
+    ],
+    cardcredit: [
+      "card", "credit card", "card number", "creditcard", "رقم البطاقة", "بطاقة", "رقم الكارت", "numéro de carte", "carte bancaire"
+    ],
+    click: [
+      "submit", "send", "validate", "confirm", "apply", "next", "continue", "done", "ok", "save"
+    ],
+    geo: [
+      "city", "ville", "مدينة", "locality", "town", "municipality", "commune", "urban", "metropolis",
+      "ciudad", "città", "cité", "ville de", "urban area", "منطقة حضرية", "بلدية", "منطقة", "location",
+      "place", "مكان", "cityname", "اسم المدينة", "living city", "current city", "residence city",
+      "home city", "work city", "city/town", "city or town", "current location", "مكان الإقامة",
+      "state", "province", "region", "ولاية", "جهة", "منطقة", "governorate", "wilaya", "statename",
+      "state/province", "state or province", "district", "state/country", "county", "state code", "territory",
+      "إقليم", "état", "estado", "stato", "province/state", "location state", "state name", "region name",
+      "current state", "residence state", "state of birth", "الولاية", "الجهة", "المنطقة",
+      "zip", "zipcode", "postal", "postal code", "postalcode", "zip code", "رمز بريدي", "code postal",
+      "post code", "postcode", "zip/postal", "zip or postal code", "postal/zip", "PLZ", "CAP", "CEP", "رمز",
+      "رمز المنطقة", "postal number", "zipnumber", "zip/postcode", "area code", "رمز المدينة", "رمز الولاية",
+      "رمز الإقامة", "رمز المكان", "zip/postal", "zip postal", "postal zip", "postalzone",
+      "street", "street address", "road", "avenue", "rue", "شارع", "avenida", "straße", "calle", "strada",
+      "road name", "streetname", "address line", "line1", "line 1", "home address", "house address",
+      "building", "apartment", "apt", "suite", "address1", "address 1", "residence address", "street/road",
+      "street/avenue", "شارع المنزل", "شارع الإقامة", "residential street", "main street", "عنوان الشارع"
+    ]
+  };
+
+  function findMatchedKeyword(el, type) {
+    const attrs = [
+      el.placeholder,
+      el.name,
+      el.id,
+      el.getAttribute('aria-label'),
+      el.title,
+      el.innerText,
+      el.value
+    ].filter(Boolean);
+    const text = attrs.map(t => t.toLowerCase()).join(" ");
+    for (const keyword of keywordMap[type]) {
+      if (text.includes(keyword)) return keyword;
+    }
+    return null;
+  }
+
+  function detectFieldType(el) {
+    const attrs = [
+      el.placeholder,
+      el.name,
+      el.id,
+      el.getAttribute('aria-label'),
+      el.title,
+      el.innerText,
+      el.value
+    ].filter(Boolean);
+    const text = attrs.map(t => t.toLowerCase()).join(" ");
+    for (const keyword of keywordMap.geo) {
+      if (text.includes(keyword)) return "geo";
+    }
+    for (const type in keywordMap) {
+      if (type === "geo") continue;
+      for (const keyword of keywordMap[type]) {
+        if (text.includes(keyword)) return type;
+      }
+    }
+    return null;
+  }
+
+  function getElementTop(el) {
+    const rect = el.getBoundingClientRect();
+    return rect.top + window.scrollY;
+  }
+
+  function saveDetectedFields(detected) {
+    window.groom.detectedFields = detected.map(({type, el, keyword, value}) => ({
+      type,
+      keyword,
+      value,
+      tagName: el.tagName,
+      id: el.id || null,
+      name: el.name || null,
+      placeholder: el.placeholder || null,
+    }));
+  }
+
+  let lastOrder = "";
+
+  function processFieldsOnceAndWatch(contextRoot = document.body) {
+    if (!window.groom.enabled) return;
+    if (!window.groom._lastFilledElements) window.groom._lastFilledElements = new Set();
+
+    const fieldElements = [...contextRoot.querySelectorAll('input, textarea, select')]
+      .filter(el => {
+        if (el.type && el.type.toLowerCase() === "hidden") return false;
+        if (el.offsetParent === null && el.type !== "radio" && el.type !== "checkbox") return false;
+        if (el.hasAttribute("hidden")) return false;
+        if (el.getAttribute("aria-hidden") === "true") return false;
+        if (getComputedStyle(el).display === "none") return false;
+        if (getComputedStyle(el).visibility === "hidden") return false;
+        if (window.groom._lastFilledElements.has(el)) return false;
+        return true;
+      });
+
+    const buttonSelector = [
+      'button',
+      'input[type="submit"]',
+      'input[type="button"]',
+      'a[role="button"]',
+      'a[href="#"]',
+      'div[role="button"]',
+      'span[role="button"]',
+      'div[id*="btn" i], div[class*="btn" i], div[id*="button" i], div[class*="button" i], div[id*="sub" i], div[class*="sub" i], div[class*="continue" i], div[id*="continue" i], div[class*="next" i]',
+      'span[id*="btn" i], span[class*="btn" i], span[id*="button" i], span[class*="button" i], span[class*="continue" i], span[id*="continue" i], span[class*="next" i], span[class*="next" i]',
+      'a[id*="btn" i], a[class*="btn" i], a[class*="continue" i], a[id*="continue" i], a[class*="next" i], a[id*="next" i]'
+    ].join(',');
+
+    const buttonElements = [
+      ...contextRoot.querySelectorAll(buttonSelector)
+    ].filter(btn => {
+      if (btn.type && btn.type.toLowerCase() === "hidden") return false;
+      if (btn.offsetParent === null) return false;
+      if (btn.hasAttribute("hidden")) return false;
+      if (btn.getAttribute("aria-hidden") === "true") return false;
+      if (getComputedStyle(btn).display === "none") return false;
+      if (getComputedStyle(btn).visibility === "hidden") return false;
+      if (window.groom._lastFilledElements.has(btn)) return false;
+      const txt = (btn.innerText || btn.value || '').toLowerCase();
+      const cls = (btn.className || '').toLowerCase();
+      const id = (btn.id || '').toLowerCase();
+      return /continue|next|submit|validate|confirm|send|done|save|التالي|متابعة|انهاء|أرسل/.test(txt + ' ' + cls + ' ' + id);
+    });
+
+    const detectedFields = [];
+    const usedTypes = new Set();
+
+    fieldElements.forEach(el => {
+      const type = detectFieldType(el);
+      if (type && type !== "click" && !usedTypes.has(type)) {
+        const keyword = findMatchedKeyword(el, type);
+        if (keyword) {
+          detectedFields.push({type, el, keyword, top: getElementTop(el)});
+          usedTypes.add(type);
+        }
+      }
+    });
+
+    detectedFields.sort((a, b) => a.top - b.top);
+
+    let orderedTypes = [];
+    detectedFields.forEach(item => {
+      if (!orderedTypes.includes(item.type)) orderedTypes.push(item.type);
+    });
+
+    let clickDetected = null;
+    for (const btn of buttonElements) {
+      const type = detectFieldType(btn);
+      if (type === "click" || btn) {
+        const keyword = findMatchedKeyword(btn, "click") || "";
+        clickDetected = {type: "click", el: btn, keyword, top: getElementTop(btn)};
+        break;
+      }
+    }
+    if (clickDetected && !orderedTypes.includes("click")) orderedTypes.push("click");
+
+    const orderString = orderedTypes.join(" → ");
+
+    const allDetected = [];
+    orderedTypes.forEach(type => {
+      if(type !== "click") {
+        const fieldObj = detectedFields.find(f => f.type === type);
+        if (fieldObj) allDetected.push(fieldObj);
+      }
+    });
+    if (clickDetected) {
+      allDetected.push(clickDetected);
+    }
+
+    saveDetectedFields(allDetected);
+
+    if (orderString !== lastOrder) {
+      console.clear();
+      console.log("🧭 Detected field order:", orderString);
+      detectedFields.forEach(({type, keyword, el}) => {
+        console.log(\`🔎 Field type: "\${type}" | keyword found: "\${keyword}" | element: \`, el);
+      });
+      if (clickDetected) {
+        console.log(\`🔎 Button type: "click" | keyword found: "\${clickDetected.keyword}" | element: \`, clickDetected.el);
+      }
+      lastOrder = orderString;
+    }
+
+    // ملء الحقول واحدًا تلو الآخر حسب ترتيب الصفحة
+    const fillFieldsSequentially = async (fields, i = 0, onDone = () => {}) => {
+      if (i >= fields.length) return onDone();
+      const {type, el} = fields[i];
+      if (window.groom.options[type]) {
+        const fn = window["fill" + type.charAt(0).toUpperCase() + type.slice(1)];
+        if (typeof fn === "function") {
+          try {
+            if (window.groom._lastFilledElements.has(el)) {
+              return setTimeout(() => fillFieldsSequentially(fields, i + 1, onDone), 60);
+            }
+            const resultEl = fn.constructor.name === "AsyncFunction" ? await fn(el) : fn(el);
+            if (resultEl) {
+              window.groom._lastFilledElements.add(resultEl);
+              const valueToKeep = resultEl.value;
+              if (!resultEl._observerAttached && valueToKeep !== undefined) {
+                const observer = new MutationObserver(() => {
+                  if (!resultEl.value || resultEl.value.trim() === "") {
+                    console.log(\`⚠️ Field "\${type}" was cleared, refilling...\`);
+                    try {
+                      resultEl.value = valueToKeep;
+                      window.groom.filledFields.add(resultEl);
+                    } catch (e) {
+                      console.warn(\`Error refilling field "\${type}":\`, e);
+                    }
+                  }
+                });
+                observer.observe(resultEl, {attributes: true, childList: false, subtree: false, characterData: false});
+                resultEl._observerAttached = true;
+              }
+            }
+          } catch (e) {
+            console.warn(\`❌ Error filling field "\${type}":\`, e);
+          }
+        }
+      }
+      setTimeout(() => fillFieldsSequentially(fields, i + 1, onDone), 120);
+    };
+
+    // إذا لم يوجد أي حقل و يوجد زر، اضغط الزر مباشرة
+    if (allDetected.length === 1 && allDetected[0].type === 'click') {
+      window.fillSurveyclickbottom(allDetected[0].el);
+      console.log("✅ fillSurveyclickbottom invoked (button only, no fields):", allDetected[0].el);
+      return;
+    }
+
+    if (allDetected.length > 0) {
+      const fieldsToFill = allDetected.filter(f => f.type !== "click");
+      fillFieldsSequentially(fieldsToFill, 0, () => {
+        if (clickDetected && clickDetected.el) {
+          window.fillSurveyclickbottom(clickDetected.el);
+          console.log("✅ fillSurveyclickbottom invoked with detected button:", clickDetected.el);
+        }
+      });
+    }
+  }
+
+  function processFieldsEverywhere() {
+    if (!window.groom.enabled) return;
+    const roots = getAllModalsAndTabs();
+    roots.forEach(root => {
+      processFieldsOnceAndWatch(root);
+    });
+  }
+
+  function startGroomInterval() {
+    stopGroomInterval();
+    processFieldsEverywhere();
+    window.groom._intervalId = setInterval(processFieldsEverywhere, 7000);
+    observeDomChanges();
+  }
+
+  function stopGroomInterval() {
+    if (window.groom._intervalId) {
+      clearInterval(window.groom._intervalId);
+      window.groom._intervalId = null;
+    }
+    if (groomMutationObserver) groomMutationObserver.disconnect();
+  }
+
+  addTabListeners();
+  observeLocationChange();
+  observeDomChanges();
+  startGroomInterval();
+})();
+`;
